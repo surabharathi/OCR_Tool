@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Form Extractor — Sri Surabharathi</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+  <!-- ── Sidebar ──────────────────────────────────────────────────────────── -->
+  <aside class="sidebar">
+    <div class="brand">
+      <img class="brand-icon" src="{{ url_for('static', filename='logo-v2.svg') }}?v=1" alt="Sri Surabharathi logo" />
+      <div>
+        <div class="brand-title">Form Extractor</div>
+        <div class="brand-sub">Sri Surabharathi Foundation</div>
+      </div>
+    </div>
+
+    <nav class="steps-nav">
+      <div class="step-item active" id="step-configure">
+        <span class="step-dot"></span>
+        <span class="step-label">Configure</span>
+      </div>
+      <div class="step-item" id="step-scan">
+        <span class="step-dot"></span>
+        <span class="step-label">GPU Scan</span>
+      </div>
+      <div class="step-item" id="step-complete">
+        <span class="step-dot"></span>
+        <span class="step-label">Complete</span>
+      </div>
+    </nav>
+
+    <div class="sidebar-stats hidden" id="sidebar-stats">
+      <div class="stat-row"><span>Processed</span><strong id="s-processed">0</strong></div>
+      <div class="stat-row"><span>Skipped</span><strong id="s-skipped">0</strong></div>
+      <div class="stat-row"><span>Failed</span><strong id="s-failed">0</strong></div>
+    </div>
+
+    <!-- GPU Badge -->
+    <div class="gpu-badge" id="gpu-badge">
+      <div class="gpu-icon">⚡</div>
+      <div class="gpu-detail">
+        <span class="gpu-label">Local GPU</span>
+        <span class="gpu-model" id="model-display">olmOCR · RTX 4090</span>
+      </div>
+    </div>
+
+    <div class="health-badge" id="health-badge">
+      <span class="health-dot" id="health-dot"></span>
+      <span id="health-text">Checking Ollama…</span>
+    </div>
+  </aside>
+
+  <!-- ── Main ─────────────────────────────────────────────────────────────── -->
+  <main class="main">
+
+    <!-- Section 1: Configure -->
+    <section class="card" id="section-configure">
+      <div class="card-header">
+        <h2>Configure Extraction</h2>
+        <p class="card-sub">
+          Running entirely on your <strong>NVIDIA RTX 4090</strong> via Ollama.
+          No API keys. No costs. No data leaves your machine.
+        </p>
+      </div>
+
+      <div class="form-grid">
+        <div class="field-group full-width">
+          <label>Image Folder Path</label>
+          <input type="text" id="image-folder"
+            placeholder="/path/to/your/form/images" />
+          <span class="field-hint">Absolute path to the folder containing JPEG/PNG/TIFF/BMP form scans or multi-page PDFs.</span>
+        </div>
+
+        <div class="field-group">
+          <label>Ollama Model</label>
+          <input type="text" id="ollama-model" value="qwen2.5vl:7b" />
+          <span class="field-hint">
+            Pull with: <code>ollama pull qwen2.5vl:7b</code><br/>
+            Alternatives: <code>reducto/rolmocr</code>, <code>allenai/olmocr2</code>
+          </span>
+        </div>
+
+        <div class="field-group">
+          <label>Ollama Server URL</label>
+          <input type="text" id="ollama-url" value="http://localhost:11434" />
+          <span class="field-hint">Default when Ollama runs locally.</span>
+        </div>
+
+        <div class="field-group full-width">
+          <label>Run Mode</label>
+          <div class="radio-group">
+            <label class="radio-label">
+              <input type="radio" name="run-mode" value="resume" checked />
+              Resume previous run (skip already-processed images)
+            </label>
+            <label class="radio-label">
+              <input type="radio" name="run-mode" value="fresh" />
+              Fresh start (re-process all images from scratch)
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <div class="card-actions">
+        <button class="btn btn-secondary" id="btn-check" onclick="checkHealth()">
+          ◎ Test Connection
+        </button>
+        <button class="btn btn-primary" id="btn-start" onclick="startScan()">
+          <span class="btn-icon">▶</span> Start GPU Scan
+        </button>
+      </div>
+    </section>
+
+    <!-- Section 2: Scan Progress -->
+    <section class="card hidden" id="section-scan">
+      <div class="card-header">
+        <h2>GPU Scan — <span id="scan-model-label">olmOCR</span></h2>
+        <p class="card-sub" id="scan-status-text">Initialising…</p>
+      </div>
+
+      <div class="progress-block">
+        <div class="progress-header">
+          <span id="progress-label">0 / 0 images</span>
+          <span id="progress-pct">0%</span>
+        </div>
+        <div class="progress-bar-track">
+          <div class="progress-bar-fill" id="progress-bar" style="width:0%"></div>
+        </div>
+      </div>
+
+      <div class="counters-row">
+        <div class="counter green">
+          <div class="counter-num" id="c-done">0</div>
+          <div class="counter-lbl">Processed</div>
+        </div>
+        <div class="counter blue">
+          <div class="counter-num" id="c-skipped">0</div>
+          <div class="counter-lbl">Skipped</div>
+        </div>
+        <div class="counter red">
+          <div class="counter-num" id="c-failed">0</div>
+          <div class="counter-lbl">Failed</div>
+        </div>
+        <div class="counter amber">
+          <div class="counter-num" id="c-rate">—</div>
+          <div class="counter-lbl">img / min</div>
+        </div>
+      </div>
+
+      <!-- Live results table -->
+      <div class="results-table-wrapper hidden" id="results-wrapper">
+        <h3 class="table-title">Live Results</h3>
+        <div class="table-scroll">
+          <table class="results-table" id="results-table">
+            <thead>
+              <tr>
+                <th>File</th>
+                <th>App No.</th>
+                <th>Name</th>
+                <th>Address</th>
+                <th>Mob No.</th>
+                <th>Email</th>
+                <th>Q1</th>
+                <th>Confidence</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="results-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card-actions">
+        <button class="btn btn-danger hidden" id="btn-stop" onclick="stopScan()">
+          ⏹ Stop Scan
+        </button>
+      </div>
+    </section>
+
+    <!-- Section 3: Complete -->
+    <section class="card hidden" id="section-complete">
+      <div class="complete-hero">
+        <div class="complete-check">✓</div>
+        <h2>Extraction Complete</h2>
+        <p id="complete-summary">All images processed.</p>
+      </div>
+
+      <div class="final-stats" id="final-stats"></div>
+
+      <div class="csv-path-block" id="csv-path-block">
+        <span class="csv-label">Output CSV</span>
+        <code id="csv-path"></code>
+      </div>
+
+      <div class="card-actions">
+        <button class="btn btn-secondary" onclick="resetUI()">↩ New Scan</button>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

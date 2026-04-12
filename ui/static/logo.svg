@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img" aria-label="Sri Surabharathi logo">
+  <defs>
+    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f6b73c" />
+      <stop offset="100%" stop-color="#f08016" />
+    </linearGradient>
+  </defs>
+  <circle cx="60" cy="60" r="58" fill="#ffffff" />
+  <circle cx="60" cy="60" r="50" fill="url(#grad)" />
+  <path d="M72 38c0 0-11 8-12 22c-1 14 6 20 6 20s-6-2-14-2s-14 2-14 2s6-6 5-20c-1-14-12-22-12-22s12 1 17 5s5 14 5 14s0-10 4-14s17-5 17-5z" fill="#fff" />
+  <path d="M42 78c0 0 15-8 36 0" stroke="#fff" stroke-width="6" stroke-linecap="round" fill="none" />
+  <path d="M40 52c0 0 8-8 12-10s10 0 10 0" stroke="#fff" stroke-width="5" stroke-linecap="round" fill="none" />
+  <path d="M80 52c0 0-8-8-12-10s-10 0-10 0" stroke="#fff" stroke-width="5" stroke-linecap="round" fill="none" />
+</svg>

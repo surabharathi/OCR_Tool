@@ -1,0 +1,22 @@
+# ── Form Extractor — Python dependencies ─────────────────────────────────────
+# Install with:  pip install -r requirements.txt
+
+# Web framework
+Flask>=3.1.0
+
+# Local VLM runtime (Ollama Python client)
+ollama>=0.2.0
+
+# Image handling and PDF rendering
+Pillow>=10.0.0
+PyMuPDF>=1.26.0
+pytesseract>=0.3.10
+opencv-python>=4.8.0
+
+# Testing
+pytest>=8.0.0
+pytest-mock>=3.14.0
+
+# Static analysis (dev only)
+flake8>=7.0.0
+pylint>=3.0.0
