@@ -14,13 +14,15 @@ Everything runs on the local GPU — zero cost per image.
 
 import concurrent.futures
 import logging
+import shutil
 import threading
 from pathlib import Path
 from typing import Callable, Optional
 
 import fitz
+import ollama
 
-from config import MAX_WORKERS, OLLAMA_BASE_URL, OLLAMA_MODEL, SUPPORTED_EXTENSIONS
+from config import CSV_BASE_NAME, MAX_WORKERS, OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT_SECONDS, SUPPORTED_EXTENSIONS
 from core.csv_writer import CSVWriter
 from core.resume_tracker import ResumeTracker
 from extractors.base_extractor import ExtractionResult
@@ -63,6 +65,11 @@ class Orchestrator:
         model:             Ollama model name (overrides config.OLLAMA_MODEL).
         base_url:          Ollama server URL (overrides config.OLLAMA_BASE_URL).
         progress_callback: Called with a progress dict after each image.
+        fresh_start:       Wipe all previous CSVs and reset the progress tracker
+                           before initialising the CSV writer.  Must be set here
+                           (not via a separate cleanup_artifacts call) so that
+                           CSVWriter creates its file *after* the old ones are
+                           removed — preventing the header from being deleted.
     """
 
     def __init__(
@@ -71,6 +78,7 @@ class Orchestrator:
         model: str = OLLAMA_MODEL,
         base_url: str = OLLAMA_BASE_URL,
         progress_callback: Optional[ProgressCallback] = None,
+        fresh_start: bool = False,
     ) -> None:
         self.image_folder = Path(image_folder)
         self.model = model
@@ -78,10 +86,23 @@ class Orchestrator:
         self.progress_callback = progress_callback or (lambda _: None)
 
         self._stop_event = threading.Event()
+        self._counter_lock = threading.Lock()  # Guards _done/_skipped/_failed across worker threads.
 
         self.tracker = ResumeTracker(self.image_folder)
+
+        # Cleanup *before* CSVWriter so that writer.writeheader() is not undone
+        # by a subsequent cleanup_artifacts() call.
+        if fresh_start:
+            self.cleanup_artifacts()
+            self.tracker.reset()
+            logger.info("Fresh start — previous artifacts deleted and progress tracker reset.")
+
         self.csv_writer = CSVWriter(self.image_folder)
-        self.extractor = OlmOCRExtractor(model=model, base_url=base_url)
+
+        # Single shared Ollama client — httpx connection pool is thread-safe;
+        # reusing it across MAX_WORKERS threads avoids per-image TCP handshakes.
+        self._ollama_client = ollama.Client(host=base_url, timeout=OLLAMA_TIMEOUT_SECONDS)
+        self.extractor = OlmOCRExtractor(model=model, base_url=base_url, client=self._ollama_client)
 
         self._total = 0
         self._done = 0
@@ -89,6 +110,40 @@ class Orchestrator:
         self._failed = 0
 
     # ── Public control ────────────────────────────────────────────────────────
+
+    def cleanup_artifacts(self) -> None:
+        """Delete all auto-generated files from previous runs in *image_folder*.
+
+        Removes:
+        * All ``extracted_data_*.csv`` files written by :class:`CSVWriter`.
+        * The ``.pdf_pages`` cache directory (rendered PDF page PNGs).
+
+        Input images and original PDF source files are never touched.
+        """
+        # ── CSV files ─────────────────────────────────────────────────────────
+        csv_pattern = f"{CSV_BASE_NAME}_*.csv"
+        deleted_csv = 0
+        for csv_file in self.image_folder.glob(csv_pattern):
+            try:
+                csv_file.unlink()
+                logger.info("Deleted previous CSV: %s", csv_file.name)
+                deleted_csv += 1
+            except OSError as exc:
+                logger.warning("Could not delete %s: %s", csv_file.name, exc)
+
+        # ── PDF page cache directory ──────────────────────────────────────────
+        pdf_cache = self.image_folder / ".pdf_pages"
+        if pdf_cache.exists():
+            try:
+                shutil.rmtree(pdf_cache)
+                logger.info("Deleted PDF page cache: %s", pdf_cache)
+            except OSError as exc:
+                logger.warning("Could not delete PDF cache %s: %s", pdf_cache, exc)
+
+        logger.info(
+            "Artifact cleanup complete — removed %d CSV file(s) and PDF page cache.",
+            deleted_csv,
+        )
 
     def stop(self) -> None:
         """Signal the pipeline to stop after the current image finishes."""
@@ -150,43 +205,48 @@ class Orchestrator:
 
         try:
             doc = fitz.open(pdf_path)
-            logger.info("PDF opened successfully: %d pages", doc.page_count)
         except Exception as exc:
             logger.error("Failed to open PDF %s: %s", pdf_path.name, exc)
             return pages
 
-        for page_index in range(doc.page_count):
-            output_path = cache_dir / f"{pdf_path.stem}_page_{page_index+1}.png"
-            logger.debug("Processing page %d/%d -> %s", page_index+1, doc.page_count, output_path.name)
+        # Use a context manager so the document is always closed — even if a
+        # page render raises an unexpected exception mid-loop.
+        with doc:
+            logger.info("PDF opened successfully: %d pages", doc.page_count)
+            for page_index in range(doc.page_count):
+                output_path = cache_dir / f"{pdf_path.stem}_page_{page_index+1}.png"
+                logger.debug("Processing page %d/%d -> %s", page_index+1, doc.page_count, output_path.name)
 
-            # Check if page already exists and is up to date
-            if output_path.exists():
-                png_mtime = output_path.stat().st_mtime
-                if png_mtime >= pdf_mtime:
-                    logger.debug("Page %d already rendered (up to date)", page_index+1)
+                # Check if page already exists and is up to date
+                if output_path.exists():
+                    png_mtime = output_path.stat().st_mtime
+                    if png_mtime >= pdf_mtime:
+                        logger.debug("Page %d already rendered (up to date)", page_index+1)
+                        pages.append(output_path)
+                        continue
+
+                try:
+                    page = doc.load_page(page_index)
+                    logger.debug("Loaded page %d, rendering...", page_index+1)
+
+                    # Render at 1.5× — sufficient for OCR, ~44% fewer pixels than
+                    # 2.0× which cuts the vision encoder's peak VRAM significantly.
+                    pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+                    logger.debug("Rendered page %d (%dx%d)", page_index+1, pix.width, pix.height)
+
+                    pix.save(output_path)
+                    del pix  # Explicitly free the C-level pixel buffer immediately;
+                              # do not wait for GC — 100-page PDFs accumulate ~440 MB.
+                    logger.info("Saved page %d to %s", page_index+1, output_path.name)
+
                     pages.append(output_path)
+                except Exception as exc:
+                    logger.error(
+                        "Failed to render page %d of %s: %s",
+                        page_index + 1, pdf_path.name, exc,
+                    )
                     continue
 
-            try:
-                page = doc.load_page(page_index)
-                logger.debug("Loaded page %d, rendering...", page_index+1)
-
-                # Render with higher resolution for better OCR
-                pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
-                logger.debug("Rendered page %d (%dx%d)", page_index+1, pix.width, pix.height)
-
-                pix.save(output_path)
-                logger.info("Saved page %d to %s", page_index+1, output_path.name)
-
-                pages.append(output_path)
-            except Exception as exc:
-                logger.error(
-                    "Failed to render page %d of %s: %s",
-                    page_index + 1, pdf_path.name, exc,
-                )
-                continue
-
-        doc.close()
         logger.info(
             "Expanded PDF %s into %d page image(s) in %s",
             pdf_path.name, len(pages), cache_dir
@@ -229,25 +289,37 @@ class Orchestrator:
         })
 
         with concurrent.futures.ThreadPoolExecutor(
-            max_workers=1,  # Use sequential processing for reliability
+            max_workers=MAX_WORKERS,
             thread_name_prefix="olmocr",
         ) as pool:
             futures = {
                 pool.submit(self._process_single, img): img
                 for img in images
             }
-            for future in concurrent.futures.as_completed(futures):
-                if self._stop_event.is_set():
-                    logger.info("Scan stopped by user after current batch.")
-                    break
-                img = futures[future]
-                try:
-                    future.result()
-                except Exception as exc:  # noqa: BLE001
-                    logger.error("Unexpected error processing %s: %s", img.name, exc, exc_info=True)
-                    self._failed += 1
-                    self.tracker.mark_failed(img.name, str(exc))
-                    self._emit_progress(img.name, "failed")
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    if self._stop_event.is_set():
+                        logger.info("Scan stopped by user after current batch.")
+                        break
+                    img = futures[future]
+                    try:
+                        future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error("Unexpected error processing %s: %s", img.name, exc, exc_info=True)
+                        with self._counter_lock:
+                            self._failed += 1
+                        self.tracker.mark_failed(img.name, str(exc))
+                        self._emit_progress(img.name, "failed")
+            except Exception:
+                # Unexpected crash (e.g. health-check RuntimeError bubbling up,
+                # or an unhandled OS error).  Notify the UI before re-raising so
+                # the SSE stream gets a terminal event instead of silently closing.
+                logger.exception("Scan terminated unexpectedly inside executor.")
+                self._emit({
+                    "type": "scan_interrupted",
+                    "message": "Scan terminated unexpectedly. Check logs for details.",
+                })
+                raise
 
         summary = {
             "type": "scan_complete",
@@ -264,13 +336,18 @@ class Orchestrator:
 
     def _process_single(self, image_path: Path) -> None:
         """Process one image — called from the thread pool."""
+        # Check stop signal first — lets queued workers exit without doing any work.
+        if self._stop_event.is_set():
+            return
+
         filename = image_path.name
         logger.info("Starting processing of: %s", filename)
 
         # ── Resume checks only; deduplication is disabled for full scan coverage. ──
         if self.tracker.is_already_handled(filename):
             logger.info("Skipping (resume): %s", filename)
-            self._skipped += 1
+            with self._counter_lock:
+                self._skipped += 1
             self._emit_progress(filename, "skipped_resume")
             return
 
@@ -283,7 +360,8 @@ class Orchestrator:
         if result.is_failed():
             logger.error("Extraction failed for %s: %s", filename, result.error)
             self.tracker.mark_failed(filename, result.error or "Unknown error")
-            self._failed += 1
+            with self._counter_lock:
+                self._failed += 1
             self._emit_progress(filename, "failed", result=result)
             return
 
@@ -293,13 +371,16 @@ class Orchestrator:
         try:
             self.csv_writer.write_record(record)
             self.tracker.mark_processed(filename)
-            self._done += 1
+            with self._counter_lock:
+                self._done += 1
             logger.info("Successfully processed: %s", filename)
             self._emit_progress(filename, "processed", result=result)
         except OSError as exc:
             logger.error("CSV write failed for %s: %s", filename, exc)
             self.tracker.mark_failed(filename, f"CSV write error: {exc}")
-            self._failed += 1
+            with self._counter_lock:
+                self._failed += 1
+            self._emit_progress(filename, "failed")
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

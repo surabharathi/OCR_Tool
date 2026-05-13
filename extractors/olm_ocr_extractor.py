@@ -16,9 +16,12 @@ model or runtime can be swapped without touching any other module.
 """
 
 import base64
+import io
 import json
 import logging
+import random
 import re
+import time
 from pathlib import Path
 
 import cv2
@@ -34,7 +37,9 @@ from config import (
     FIELD_VALIDATION_CONFIDENCE,
     NEEDS_REVIEW_CONFIDENCE,
     OLLAMA_BASE_URL,
+    OLLAMA_MAX_RETRIES,
     OLLAMA_MODEL,
+    OLLAMA_RETRY_DELAY_SECONDS,
     OLLAMA_TIMEOUT_SECONDS,
     TESSERACT_CMD,
     UNREADABLE_CONFIDENCE,
@@ -109,10 +114,13 @@ def _preprocess_image(image_path: Path) -> Image.Image:
 
 def _apply_exif_orientation(img: Image.Image) -> Image.Image:
     """Apply EXIF orientation tag to correct image rotation."""
-    if not hasattr(img, '_getexif') or img._getexif() is None:
+    try:
+        exif = img.getexif()  # Public Pillow 6.0+ API; _getexif() is deprecated.
+    except (AttributeError, Exception):
+        return img
+    if not exif:
         return img
 
-    exif = img._getexif()
     orientation = exif.get(274)  # EXIF Orientation tag
 
     if orientation == 1:
@@ -188,11 +196,9 @@ def _enhance_for_ocr(img: Image.Image) -> Image.Image:
 
 def _deskew_image(img: Image.Image) -> Image.Image:
     """Deskew the image to correct slight rotations."""
-    import numpy as np
-    from scipy.ndimage import interpolation as inter
-
-    # Convert to numpy array
-    img_array = np.array(img)
+    # Convert to numpy array, ensuring clean uint8 data (avoids null-byte
+    # issues that arise when raw image buffers contain unexpected byte values).
+    img_array = np.array(img, dtype=np.uint8)
 
     # Threshold to binary
     _, thresh = cv2.threshold(img_array, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
@@ -258,7 +264,12 @@ _EXTRACTION_PROMPT = (
 )
 
 
-def _call_ollama(model: str, image_path: Path, base_url: str) -> str:
+def _call_ollama(
+    model: str,
+    image_path: Path,
+    base_url: str,
+    client: "ollama.Client | None" = None,
+) -> str:
     """Send *image_path* + extraction prompt to the Ollama model.
 
     This is the ONLY function that touches the Ollama SDK / HTTP layer.
@@ -268,6 +279,8 @@ def _call_ollama(model: str, image_path: Path, base_url: str) -> str:
         model:      Ollama model name, e.g. ``"reducto/rolmocr"``.
         image_path: Path to the JPEG/PNG form image.
         base_url:   Ollama server base URL.
+        client:     Pre-built ``ollama.Client`` to reuse (avoids per-call TCP
+                    handshake overhead).  A new client is created when *None*.
 
     Returns:
         Raw text response from the model.
@@ -284,12 +297,13 @@ def _call_ollama(model: str, image_path: Path, base_url: str) -> str:
     processed_img = _preprocess_image(image_path)
 
     # Convert to base64 for Ollama API
-    import io
     buffer = io.BytesIO()
     processed_img.save(buffer, format='PNG')
     image_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-    client = ollama.Client(host=base_url, timeout=OLLAMA_TIMEOUT_SECONDS)
+    # Reuse the caller-supplied client (connection pool); create one only as fallback.
+    if client is None:
+        client = ollama.Client(host=base_url, timeout=OLLAMA_TIMEOUT_SECONDS)
 
     response = client.chat(
         model=model,
@@ -302,7 +316,8 @@ def _call_ollama(model: str, image_path: Path, base_url: str) -> str:
         ],
         options={
             "temperature": 0.0,      # Deterministic output for data extraction.
-            "num_predict": 512,      # Sufficient for the JSON response.
+            "num_predict": 1024,     # 12-field JSON with address text needs up to
+                                     # ~700 tokens; 512 truncates longer responses.
         },
     )
 
@@ -315,11 +330,73 @@ def _call_ollama(model: str, image_path: Path, base_url: str) -> str:
 # ── JSON parsing ──────────────────────────────────────────────────────────────
 
 
+def _sanitise_control_chars(text: str) -> str:
+    """Escape raw control characters (U+0000–U+001F) inside JSON string values.
+
+    The LLM sometimes emits raw newlines, carriage returns, or other control
+    characters inside JSON string values, which causes json.loads to raise
+    "Invalid control character at ...".  This function walks the text and
+    replaces those raw bytes with their valid JSON escape sequences.
+    """
+    result: list[str] = []
+    in_string = False
+    i = 0
+    _escape_map = {
+        '\n': '\\n', '\r': '\\r', '\t': '\\t',
+        '\b': '\\b', '\f': '\\f',
+    }
+    while i < len(text):
+        ch = text[i]
+        if ch == '\\' and in_string:
+            # Pass through escape sequence unchanged.
+            result.append(ch)
+            i += 1
+            if i < len(text):
+                result.append(text[i])
+        elif ch == '"':
+            result.append(ch)
+            in_string = not in_string
+        elif in_string and ord(ch) < 0x20:
+            # Raw control char — replace with its JSON escape (or a space).
+            result.append(_escape_map.get(ch, ' '))
+        else:
+            result.append(ch)
+        i += 1
+    return ''.join(result)
+
+
+def _remove_bare_keys(text: str) -> str:
+    """Strip bare JSON key strings that have no colon-value pair.
+
+    The LLM occasionally outputs lines like::
+
+        "q3",
+
+    (a quoted string followed by a comma, with no ':' value) inside a JSON
+    object.  These are invalid and cause parse failures.  Lines that consist
+    only of a quoted string (with optional trailing comma) are removed.
+    Afterwards, any duplicate commas left by the removal are collapsed.
+    """
+    # Match lines that are *only* a quoted string (+ optional comma/whitespace).
+    # Valid key-value lines always contain a ':' so they will never match.
+    cleaned = re.sub(r'(?m)^\s*"[^"]*"\s*,?\s*$\n?', '', text)
+    # Collapse duplicate commas that the removal may have introduced.
+    cleaned = re.sub(r',(\s*,)+', ',', cleaned)
+    return cleaned
+
+
 def _parse_response(raw: str) -> dict:
     """Parse the model's JSON response, stripping any accidental markdown fences.
 
+    Handles common LLM output quirks:
+      - Markdown code fences (``` / ```json)
+      - Raw control characters inside string values (\n, \r, \x00–\x1f)
+      - Bare key lines with no colon-value pair (e.g. ``"q3",``)
+      - Trailing commas before } or ] (invalid in standard JSON)
+      - Truncated responses (missing closing brace)
+
     Raises:
-        json.JSONDecodeError: if the cleaned text is not valid JSON.
+        json.JSONDecodeError: if the cleaned text cannot be repaired into valid JSON.
     """
     # Strip ``` / ```json fences that sometimes appear despite instructions.
     cleaned = re.sub(r"```(?:json)?\s*", "", raw, flags=re.IGNORECASE).strip()
@@ -329,8 +406,54 @@ def _parse_response(raw: str) -> dict:
     match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if match:
         cleaned = match.group(0)
+    else:
+        # Response may be truncated — try to close the open brace.
+        brace_match = re.search(r"\{", cleaned)
+        if brace_match:
+            cleaned = cleaned[brace_match.start():].rstrip().rstrip(",") + "\n}"
 
-    return json.loads(cleaned)
+    # Escape raw control characters inside string values.
+    cleaned = _sanitise_control_chars(cleaned)
+
+    # Remove bare key lines that have no colon-value pair.
+    cleaned = _remove_bare_keys(cleaned)
+
+    # Remove trailing commas before } or ] (common LLM mistake, invalid JSON).
+    cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        # ── Unterminated string ────────────────────────────────────────────────
+        # The model sometimes stops mid-value, e.g.:
+        #   {"app_no": "123",\n  "name": "
+        # The earlier `else` branch already appended "\n}" which makes the text
+        # *look* complete, but the open string literal is still unterminated.
+        # exc.pos is the character offset of the opening " of that string.
+        # Roll back to the last complete key-value pair (last comma before pos),
+        # then close the object.  Fields after the cut-off point will be absent
+        # from the result and the record will be flagged for review automatically.
+        if "Unterminated string" in str(exc):
+            prefix = cleaned[: exc.pos].rstrip()
+            last_comma = prefix.rfind(",")
+            if last_comma != -1:
+                prefix = prefix[: last_comma]
+            else:
+                # Even the first field is truncated — keep just the opening brace.
+                brace = prefix.find("{")
+                prefix = prefix[: brace + 1] if brace != -1 else "{"
+            prefix = prefix.rstrip()
+            if not prefix.endswith("}"):
+                prefix += "\n}"
+            prefix = re.sub(r",\s*([}\]])", r"\1", prefix)
+            return json.loads(prefix)
+        # ── Missing closing brace ──────────────────────────────────────────────
+        # Last resort: if still truncated, close the object and try again.
+        if not cleaned.rstrip().endswith("}"):
+            cleaned = cleaned.rstrip().rstrip(",") + "\n}"
+            cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
+            return json.loads(cleaned)
+        raise
 
 
 # ── Confidence scoring ────────────────────────────────────────────────────────
@@ -412,15 +535,21 @@ class OlmOCRExtractor(BaseExtractor):
     Args:
         model:    Ollama model name.  Defaults to ``config.OLLAMA_MODEL``.
         base_url: Ollama server URL.  Defaults to ``config.OLLAMA_BASE_URL``.
+        client:   Shared ``ollama.Client`` instance.  When supplied the extractor
+                  reuses the HTTP connection pool across calls (recommended when
+                  running multiple worker threads).  Defaults to *None* which
+                  creates a new client per call (safe but slower).
     """
 
     def __init__(
         self,
         model: str = OLLAMA_MODEL,
         base_url: str = OLLAMA_BASE_URL,
+        client: "ollama.Client | None" = None,
     ) -> None:
         self._model = model
         self._base_url = base_url
+        self._client = client  # Shared; thread-safe (httpx connection pool).
 
     @property
     def engine_name(self) -> str:
@@ -431,15 +560,27 @@ class OlmOCRExtractor(BaseExtractor):
         try:
             client = ollama.Client(host=self._base_url, timeout=10)
             models_response = client.list()
-            
-            # Extract model names; try different response formats
+
+            # Handle both old SDK (dict) and new SDK (ListResponse Pydantic model).
+            # Old SDK (< 0.2): returns {'models': [{'name': 'model:tag', ...}]}
+            # New SDK (>= 0.2): returns ListResponse with a .models list of Model objects.
+            try:
+                model_list = list(models_response.models)  # new SDK: ListResponse.models
+            except AttributeError:
+                model_list = models_response.get("models", [])  # old SDK: plain dict
+
             available = []
-            for m in models_response.get("models", []):
-                # Try 'name' first, then 'model'
-                model_name = m.get("name") or m.get("model")
+            for m in model_list:
+                # New SDK: Model is a Pydantic object with a .model attribute.
+                # Old SDK: dict with a 'name' or 'model' key.
+                model_name = (
+                    getattr(m, "model", None)
+                    or getattr(m, "name", None)
+                    or (m.get("name") or m.get("model") if hasattr(m, "get") else None)
+                )
                 if model_name:
                     available.append(model_name)
-            
+
             if not available:
                 logger.warning(
                     "Ollama is reachable but has no models pulled. "
@@ -468,14 +609,43 @@ class OlmOCRExtractor(BaseExtractor):
         """Run the local VLM on *image_path* and return a structured result."""
         logger.info("[OlmOCR] Processing: %s (model=%s)", image_path.name, self._model)
 
-        try:
-            raw_response = _call_ollama(self._model, image_path, self._base_url)
-            logger.debug("[OlmOCR] Raw response:\n%s", raw_response[:600])
-        except (FileNotFoundError, ValueError, Exception) as exc:  # noqa: BLE001
-            logger.error("[OlmOCR] Inference failed for %s: %s", image_path.name, exc)
+        raw_response: str | None = None
+        last_exc: Exception | None = None
+        for attempt in range(1, OLLAMA_MAX_RETRIES + 1):
+            try:
+                raw_response = _call_ollama(
+                    self._model, image_path, self._base_url, client=self._client
+                )
+                logger.debug("[OlmOCR] Raw response:\n%s", raw_response[:600])
+                break  # Success — exit retry loop.
+            except FileNotFoundError as exc:
+                # File missing — retrying won't help.
+                logger.error("[OlmOCR] Inference failed for %s: %s", image_path.name, exc)
+                return ExtractionResult(
+                    fields={}, confidences={}, engine=self.engine_name,
+                    error=f"Ollama inference error: {exc}",
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt < OLLAMA_MAX_RETRIES:
+                    # Exponential backoff with jitter: base * 2^(attempt-1) + rand(0,1).
+                    # Gives Ollama time to release VRAM before the next encode pass.
+                    delay = OLLAMA_RETRY_DELAY_SECONDS * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                    logger.warning(
+                        "[OlmOCR] Attempt %d/%d failed for %s: %s — retrying in %.1fs",
+                        attempt, OLLAMA_MAX_RETRIES, image_path.name, exc, delay,
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.error(
+                        "[OlmOCR] Inference failed for %s after %d attempts: %s",
+                        image_path.name, OLLAMA_MAX_RETRIES, exc,
+                    )
+
+        if raw_response is None:
             return ExtractionResult(
                 fields={}, confidences={}, engine=self.engine_name,
-                error=f"Ollama inference error: {exc}",
+                error=f"Ollama inference error: {last_exc}",
             )
 
         try:

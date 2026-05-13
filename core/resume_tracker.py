@@ -100,6 +100,10 @@ class ResumeTracker:
         with self._lock:
             if filename not in self._data["processed"]:
                 self._data["processed"].append(filename)
+            # Remove any prior failed entry — file succeeded on retry.
+            self._data["failed"] = [
+                e for e in self._data["failed"] if e["file"] != filename
+            ]
             self._save()
 
     def mark_skipped_duplicate(self, filename: str) -> None:
@@ -110,6 +114,10 @@ class ResumeTracker:
 
     def mark_failed(self, filename: str, reason: str) -> None:
         with self._lock:
+            # Remove any previous entry for this file so re-runs don't duplicate.
+            self._data["failed"] = [
+                e for e in self._data["failed"] if e["file"] != filename
+            ]
             entry = {
                 "file": filename,
                 "reason": reason,

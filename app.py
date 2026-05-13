@@ -23,6 +23,7 @@ from config import (
     FLASK_DEBUG, FLASK_HOST, FLASK_PORT,
     OLLAMA_BASE_URL, OLLAMA_MODEL, SSE_HEARTBEAT_INTERVAL,
 )
+from core.ollama_launcher import ensure_ollama_running, start_watchdog
 from core.orchestrator import Orchestrator
 from extractors.olm_ocr_extractor import OlmOCRExtractor
 
@@ -97,31 +98,42 @@ def start_scan():
         return jsonify({"error": f"Folder does not exist: {image_folder}"}), 400
 
     scan_id = uuid.uuid4().hex
-    progress_q: queue.Queue = queue.Queue(maxsize=1000)  # Increase queue size
+    progress_q: queue.Queue = queue.Queue(maxsize=1000)
+
+    def _safe_put(event: dict) -> None:
+        """Non-blocking enqueue — drops the event if the queue is full.
+
+        A disconnected SSE client stops draining the queue.  Using the default
+        blocking put() would cause the scan thread to hang permanently once the
+        1 000-slot buffer is exhausted.  Dropping a progress event is far
+        preferable to a deadlocked scan.
+        """
+        try:
+            progress_q.put_nowait(event)
+        except queue.Full:
+            logger.warning("Progress queue full — dropping event: %s", event.get("type"))
 
     orchestrator = Orchestrator(
         image_folder=folder_path,
         model=model,
         base_url=base_url,
-        progress_callback=progress_q.put,
+        progress_callback=_safe_put,
+        fresh_start=fresh_start,
     )
-
-    if fresh_start:
-        orchestrator.tracker.reset()
-        logger.info("Fresh start — progress tracker reset.")
 
     # Run asynchronously in a background thread so the UI can stream progress.
     def _run_scan() -> None:
         logger.info("Starting asynchronous scan %s for folder: %s", scan_id[:8], image_folder)
         try:
-            result = orchestrator.run()
-            logger.info("Scan %s completed successfully: %s", scan_id[:8], result)
-            progress_q.put({"type": "scan_complete", **result})
+            orchestrator.run()
+            # orchestrator.run() already emits scan_complete via the callback;
+            # do NOT put another one here — that would deliver the event twice.
+            logger.info("Scan %s completed successfully.", scan_id[:8])
         except Exception as exc:
             logger.exception("Scan %s crashed: %s", scan_id[:8], exc)
-            progress_q.put({"type": "error", "message": str(exc)})
+            progress_q.put_nowait({"type": "error", "message": str(exc)})
         finally:
-            progress_q.put(None)  # Signal SSE generator to close.
+            progress_q.put_nowait(None)  # Signal SSE generator to close.
             session = _get_session(scan_id)
             if session is not None:
                 session["status"] = "completed"
@@ -186,6 +198,9 @@ def stop_scan(scan_id: str):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    _ollama_proc = ensure_ollama_running(OLLAMA_BASE_URL)
+    if _ollama_proc is not None:
+        start_watchdog(_ollama_proc, OLLAMA_BASE_URL)
     logger.info("Starting Form Extractor on http://%s:%d", FLASK_HOST, FLASK_PORT)
     app.run(
         host=FLASK_HOST,
